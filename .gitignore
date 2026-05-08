@@ -50,3 +50,6 @@ Thumbs.db
 
 # Traces
 traces/
+
+# Internal documentation
+INTERNAL_FEATURES.md
