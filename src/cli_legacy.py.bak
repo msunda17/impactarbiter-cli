@@ -1,0 +1,543 @@
+import click
+import os
+import sys
+import importlib.util
+import torch
+import sympy
+import math
+import re
+import json
+import tempfile
+from typing import Callable, Optional
+from datetime import datetime, timezone
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. ORACLE ENGINE  — DO NOT MODIFY
+# ─────────────────────────────────────────────────────────────────────────────
+NUM_PHYSICAL_BLOCKS, BLOCK_SIZE, HEAD_DIM, NUM_KV_HEADS = 32, 16, 64, 8
+KV_CACHE_HEAD_STRIDE = HEAD_DIM * NUM_KV_HEADS
+
+torch.manual_seed(42)
+block_table = torch.randint(
+    low=0, high=NUM_PHYSICAL_BLOCKS,
+    size=(NUM_PHYSICAL_BLOCKS,), dtype=torch.long
+)
+KV_cache = torch.randn(
+    NUM_PHYSICAL_BLOCKS, BLOCK_SIZE, KV_CACHE_HEAD_STRIDE,
+    dtype=torch.float32, requires_grad=True
+)
+dummy_query = torch.randn(KV_CACHE_HEAD_STRIDE, dtype=torch.float32)
+
+
+def build_oracle():
+    token_idx  = sympy.Symbol("token_idx",  nonnegative=True, integer=True)
+    block_size = sympy.Symbol("block_size", positive=True,    integer=True)
+    logical_block_expr = sympy.floor(token_idx / block_size)
+    offset_expr        = token_idx % block_size
+    torch_ns = {
+        "floor": lambda x: (
+            int(math.floor(x)) if not isinstance(x, torch.Tensor)
+            else torch.floor(x).long()
+        ),
+        "Mod": lambda a, b: a % b,
+    }
+    return sympy.lambdify(
+        (token_idx, block_size),
+        (logical_block_expr, offset_expr),
+        modules=[torch_ns, "math"]
+    )
+
+
+ORACLE_FN = build_oracle()
+
+
+def run_proxy(logical_block_int: int, offset_int: int) -> torch.Tensor:
+    if KV_cache.grad is not None:
+        KV_cache.grad.zero_()
+    physical_block = int(block_table[logical_block_int].item())
+    fetched_vector = KV_cache[physical_block, offset_int, :]
+    mock_score = torch.sum(fetched_vector * dummy_query)
+    mock_score.backward()
+    return KV_cache.grad.clone()
+
+
+def evaluate_kernel(target_fn: Callable) -> dict:
+    """Fuzzes the target function across multiple token boundary cases."""
+    token_test_cases = [15, 32, 104, 281, 432]
+    for token_idx in token_test_cases:
+        lb_raw, off_raw = ORACLE_FN(
+            torch.tensor(token_idx, dtype=torch.float32),
+            torch.tensor(BLOCK_SIZE, dtype=torch.float32)
+        )
+        oracle_lb  = int(lb_raw.item())  if isinstance(lb_raw,  torch.Tensor) else int(lb_raw)
+        oracle_off = int(off_raw.item()) if isinstance(off_raw, torch.Tensor) else int(off_raw)
+        oracle_grad = run_proxy(oracle_lb, oracle_off)
+        try:
+            agent_lb, agent_off = target_fn(token_idx, BLOCK_SIZE)
+            agent_lb  = max(0, min(int(agent_lb),  NUM_PHYSICAL_BLOCKS - 1))
+            agent_off = max(0, min(int(agent_off), BLOCK_SIZE - 1))
+            agent_grad = run_proxy(agent_lb, agent_off)
+            grad_match = torch.allclose(oracle_grad, agent_grad, rtol=1e-05, atol=1e-08)
+            if not grad_match:
+                return {
+                    "status": "FAIL", "token": token_idx,
+                    "error": (
+                        f"Gradient Divergence at token {token_idx}. "
+                        f"Oracle expected logical block {oracle_lb}, offset {oracle_off}. "
+                        f"Agent mapped to {agent_lb}, {agent_off}."
+                    )
+                }
+        except Exception as e:
+            return {"status": "ERROR", "token": token_idx, "error": str(e)}
+    return {"status": "PASS", "token": "ALL", "error": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_byok_function(file_path: str) -> Callable:
+    """Dynamically loads paged_attention_mapping from a Python file."""
+    spec = importlib.util.spec_from_file_location("byok_module", file_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["byok_module"] = module
+    spec.loader.exec_module(module)
+    if hasattr(module, "paged_attention_mapping"):
+        return module.paged_attention_mapping
+    raise ValueError(f"Function 'paged_attention_mapping' not found in {file_path}")
+
+
+def extract_python_code(text: str) -> str:
+    """
+    Strips markdown fences from LLM output.
+    Falls back to the raw text when no fences are present (bare code mode).
+    """
+    match = re.search(r"```(?:python)?\n(.*?)\n```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. ENGINEER AGENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+ENGINEER_PERSONA = (
+    "You are a Senior ML Infrastructure Engineer specializing in CUDA and PyTorch "
+    "memory management. Your task is to write a highly optimized "
+    "`paged_attention_mapping(token_idx, block_size)` function that returns "
+    "(logical_block, offset). "
+    "You must output ONLY raw, executable Python code. "
+    "No markdown formatting, no explanations."
+)
+
+INITIAL_TASK = (
+    "Implement the function `paged_attention_mapping(token_idx, block_size)` "
+    "that maps a flat token index to a (logical_block, offset) tuple inside "
+    "vLLM's PagedAttention KV-cache. "
+    "Use strict integer floor-division and modulo arithmetic. "
+    "Return ONLY the bare Python function. No imports, no markdown, no comments."
+)
+
+
+class EngineerAgent:
+    """
+    A stateful LLM agent that maintains conversation history and generates
+    PagedAttention kernel implementations on demand.
+    """
+
+    def __init__(self, generate_fn: Callable, model_label: str):
+        self.generate_fn  = generate_fn
+        self.model_label  = model_label
+        self.message_history: list[dict] = [
+            {"role": "system", "content": ENGINEER_PERSONA}
+        ]
+
+    def generate_implementation(self, feedback_payload: Optional[str] = None) -> str:
+        """
+        Calls the LLM.
+        - On the first call (feedback_payload=None) it injects the initial task.
+        - On retry calls it appends the Supervisor's observation as a user turn.
+        Returns the raw LLM response text.
+        """
+        if feedback_payload is None:
+            self.message_history.append(
+                {"role": "user", "content": INITIAL_TASK}
+            )
+        else:
+            # Append the previous assistant response that caused the failure,
+            # then the supervisor observation — standard RLHF-style turn structure.
+            # (The supervisor appends the assistant turn before calling us again.)
+            self.message_history.append(
+                {"role": "user", "content": feedback_payload}
+            )
+
+        raw_output = self.generate_fn(self.message_history)
+        # Record the assistant turn so subsequent calls have full context.
+        self.message_history.append(
+            {"role": "assistant", "content": raw_output}
+        )
+        return raw_output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. AGENT SUPERVISOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AgentSupervisor:
+    """
+    Orchestrates the EngineerAgent ↔ ImpactArbiter validation loop.
+    Logs the full conversation trace to traces/<id>.json.
+    """
+
+    def __init__(self, agent: EngineerAgent, max_retries: int = 3):
+        self.agent       = agent
+        self.max_retries = max_retries
+        self.trace: dict = {
+            "run_id":    os.urandom(4).hex(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model":     agent.model_label,
+            "attempts":  [],
+        }
+
+    # ── pretty-print helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_engineer(msg: str):
+        click.secho(f"\n[ENGINEER AGENT]  {msg}", fg="cyan", bold=True)
+
+    @staticmethod
+    def _log_supervisor(msg: str):
+        click.secho(f"[IMPACT ARBITER SUPERVISOR]  {msg}", fg="magenta", bold=True)
+
+    @staticmethod
+    def _log_pass(msg: str):
+        click.secho(f"[IMPACT ARBITER SUPERVISOR]  ✅ {msg}", fg="green", bold=True)
+
+    @staticmethod
+    def _log_fail(msg: str):
+        click.secho(f"[IMPACT ARBITER SUPERVISOR]  ❌ {msg}", fg="red", bold=True)
+
+    # ── core loop ────────────────────────────────────────────────────────────
+
+    def run(self) -> bool:
+        """
+        Drives the generate → validate → feedback loop.
+        Returns True on PASS, False if all retries are exhausted.
+        """
+        os.makedirs("traces", exist_ok=True)
+
+        feedback_payload: Optional[str] = None
+
+        for attempt in range(1, self.max_retries + 1):
+            self._log_supervisor(
+                f"Dispatching generation task to EngineerAgent "
+                f"(attempt {attempt}/{self.max_retries})..."
+            )
+
+            # ── 1. Generate ──────────────────────────────────────────────────
+            try:
+                raw_output = self.agent.generate_implementation(feedback_payload)
+            except Exception as e:
+                self._log_fail(f"LLM API error: {e}")
+                sys.exit(1)
+
+            code = extract_python_code(raw_output)
+
+            self._log_engineer(f"Proposed implementation (attempt {attempt}):")
+            click.secho("─" * 60, fg="cyan")
+            click.echo(code)
+            click.secho("─" * 60, fg="cyan")
+
+            # ── 2. Write to temp file ────────────────────────────────────────
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py",
+                prefix=f"arbiter_kernel_a{attempt}_",
+                delete=False
+            ) as tmp:
+                tmp.write(code)
+                tmp_path = tmp.name
+
+            # ── 3. Validate with ImpactArbiter ───────────────────────────────
+            attempt_record: dict = {
+                "attempt":        attempt,
+                "generated_code": code,
+                "status":         None,
+                "observation":    None,
+            }
+
+            try:
+                target_fn = load_byok_function(tmp_path)
+                result    = evaluate_kernel(target_fn)
+                attempt_record["status"] = result["status"]
+
+                if result["status"] == "PASS":
+                    self.trace["attempts"].append(attempt_record)
+                    self._log_pass(
+                        "Mathematical validation PASSED. "
+                        "Tensor gradients matched SymPy Oracle on all boundary tokens."
+                    )
+                    self._save_trace()
+                    return True
+
+                # ── FAIL: build Supervisor observation ───────────────────────
+                observation = (
+                    f"OBSERVATION: Mathematical validation failed. "
+                    f"Gradient divergence detected in KV_cache leaf tensor. "
+                    f"Error details: {result['error']}. "
+                    f"Re-calculate the boundary arithmetic."
+                )
+                attempt_record["observation"] = observation
+                self.trace["attempts"].append(attempt_record)
+
+                self._log_fail(
+                    f"Gradient divergence detected at token {result['token']}."
+                )
+                click.secho(f"  → {result['error']}", fg="red")
+                self._log_supervisor(
+                    "Injecting autograd traceback into EngineerAgent context..."
+                )
+                click.secho(f"  Observation: {observation}", fg="yellow")
+
+                # Prepare feedback for the next generate_implementation() call.
+                # We must also record the assistant turn in the history so the
+                # agent's message_history is coherent (already done inside
+                # generate_implementation; here we only need the user feedback).
+                feedback_payload = observation
+
+            except Exception as e:
+                observation = (
+                    f"OBSERVATION: Your code caused a Python Runtime Error: {e}. "
+                    f"Fix the syntax and strictly output only the "
+                    f"`paged_attention_mapping(token_idx, block_size)` function."
+                )
+                attempt_record["status"]      = "CRASH"
+                attempt_record["observation"] = observation
+                self.trace["attempts"].append(attempt_record)
+
+                self._log_fail(f"Execution crash: {e}")
+                self._log_supervisor("Injecting runtime error into EngineerAgent context...")
+                feedback_payload = observation
+
+            finally:
+                os.unlink(tmp_path)
+
+        # ── All retries exhausted ────────────────────────────────────────────
+        self._log_fail(
+            f"EngineerAgent exhausted all {self.max_retries} attempts. "
+            f"Validation FAILED."
+        )
+        self._save_trace()
+        return False
+
+    def _save_trace(self):
+        trace_path = f"traces/trace_{self.trace['run_id']}.json"
+        with open(trace_path, "w") as f:
+            json.dump(self.trace, f, indent=2)
+        click.secho(
+            f"\n💾  Full agent conversation trace saved → {trace_path}",
+            fg="cyan", bold=True
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. PROVIDER FACTORY  (litellm-style via standard openai SDK base_url overrides)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_generate_fn(provider: str, api_key: Optional[str], model: str,
+                      project_id: Optional[str], location: str) -> tuple[Callable, str]:
+    """
+    Returns (generate_fn, model_label).
+    generate_fn(messages: list[dict]) -> str
+
+    Supports three backends:
+      vertex    — google-cloud-aiplatform SDK
+      openai    — openai SDK  (also compatible with any OpenAI-spec endpoint)
+      anthropic — anthropic SDK
+    """
+    if provider == "vertex":
+        if not project_id:
+            click.secho("❌  --project-id is required for Vertex AI.", fg="red")
+            sys.exit(1)
+        try:
+            import vertexai
+            from vertexai.generative_models import GenerativeModel
+        except ImportError:
+            click.secho(
+                "❌  google-cloud-aiplatform not installed. "
+                "Run: pip install 'impactarbiter-cli[vertex]'", fg="red"
+            )
+            sys.exit(1)
+
+        actual_model = model if model != "gpt-4o" else "gemini-2.5-pro"
+        vertexai.init(project=project_id, location=location)
+        vertex_model = GenerativeModel(actual_model)
+        click.secho(
+            f"✅  Vertex AI ready — project={project_id} model={actual_model}",
+            fg="green"
+        )
+
+        def generate_vertex(messages: list[dict]) -> str:
+            prompt = "\n\n".join(
+                f"{m['role'].capitalize()}: {m['content']}" for m in messages
+            )
+            return vertex_model.generate_content(prompt).text
+
+        return generate_vertex, actual_model
+
+    elif provider == "openai":
+        if not api_key:
+            click.secho("❌  --api-key is required for OpenAI.", fg="red")
+            sys.exit(1)
+        try:
+            from openai import OpenAI
+        except ImportError:
+            click.secho(
+                "❌  openai not installed. Run: pip install 'impactarbiter-cli[openai]'",
+                fg="red"
+            )
+            sys.exit(1)
+
+        client = OpenAI(api_key=api_key)
+        click.secho(f"✅  OpenAI ready — model={model}", fg="green")
+
+        def generate_openai(messages: list[dict]) -> str:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, temperature=0.2
+            )
+            return resp.choices[0].message.content
+
+        return generate_openai, model
+
+    elif provider == "anthropic":
+        if not api_key:
+            click.secho("❌  --api-key is required for Anthropic.", fg="red")
+            sys.exit(1)
+        try:
+            import anthropic as anthropic_sdk
+        except ImportError:
+            click.secho(
+                "❌  anthropic not installed. Run: pip install 'impactarbiter-cli[anthropic]'",
+                fg="red"
+            )
+            sys.exit(1)
+
+        client = anthropic_sdk.Anthropic(api_key=api_key)
+        click.secho(f"✅  Anthropic ready — model={model}", fg="green")
+
+        def generate_anthropic(messages: list[dict]) -> str:
+            system   = next((m["content"] for m in messages if m["role"] == "system"), "")
+            user_msgs = [m for m in messages if m["role"] != "system"]
+            resp = client.messages.create(
+                model=model, max_tokens=1024, system=system,
+                messages=user_msgs, temperature=0.2
+            )
+            return resp.content[0].text
+
+        return generate_anthropic, model
+
+    else:
+        click.secho(f"❌  Unknown provider '{provider}'.", fg="red")
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CLI ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@click.group()
+def cli():
+    """ImpactArbiter MVP: Deterministic ML Infra Fuzzer."""
+    pass
+
+
+@cli.command()
+@click.option("--file", required=True, type=click.Path(exists=True),
+              help="Path to BYOK Python file.")
+def audit_kernel(file):
+    """BYOK Mode: Run the SymPy autograd trap against a local kernel file."""
+    click.secho(f"🚀  Loading kernel from {file}...", fg="cyan", bold=True)
+    try:
+        target_fn = load_byok_function(file)
+        result    = evaluate_kernel(target_fn)
+
+        if result["status"] == "PASS":
+            click.secho(
+                "\n🎉  VALIDATION PASSED: Tensor gradients matched SymPy Oracle.",
+                fg="green", bold=True
+            )
+        else:
+            click.secho("\n❌  GRADIENT DIVERGENCE DETECTED",
+                        fg="red", bold=True, bg="black")
+            click.secho(f"Details: {result['error']}", fg="red")
+            click.secho(
+                "\n========== COPY THIS PAYLOAD FOR LLM ==========",
+                fg="magenta", bold=True
+            )
+            click.echo(
+                f"The generated PagedAttention mapping failed mathematical validation.\n"
+                f"Trace: {result['error']}\n"
+                f"Action Required: Refactor the floor division and modulo arithmetic "
+                f"to perfectly align with the deterministic memory boundaries. "
+                f"Do not use ceil or constant biases."
+            )
+            click.secho("===============================================\n",
+                        fg="magenta", bold=True)
+    except Exception as e:
+        click.secho(f"⚠️  Execution Error: {e}", fg="yellow")
+
+
+@cli.command()
+@click.option("--api-key",    required=False, default=None,
+              help="LLM Provider API Key (not required for Vertex AI).")
+@click.option("--provider",   default="vertex",
+              type=click.Choice(["vertex", "openai", "anthropic"]),
+              help="LLM backend provider.")
+@click.option("--project-id", required=False, default=None,
+              help="GCP Project ID (Vertex AI only).")
+@click.option("--location",   default="us-central1",
+              help="GCP region (Vertex AI only).")
+@click.option("--model",      default="gpt-4o",
+              help="Model name. Defaults to gemini-1.5-pro on Vertex.")
+@click.option("--max-retries", default=3, type=int,
+              help="Maximum auto-heal attempts before giving up.")
+def auto_heal(api_key, provider, project_id, location, model, max_retries):
+    """
+    Agentic Mode: EngineerAgent generates a kernel, ImpactArbiter validates it,
+    and the AgentSupervisor feeds autograd traces back until PASS or max retries.
+    """
+    click.secho(
+        "\n╔══════════════════════════════════════════════════════════╗",
+        fg="magenta", bold=True
+    )
+    click.secho(
+        "║       IMPACT ARBITER  —  AGENTIC VALIDATION LOOP        ║",
+        fg="magenta", bold=True
+    )
+    click.secho(
+        "╚══════════════════════════════════════════════════════════╝\n",
+        fg="magenta", bold=True
+    )
+
+    # 1. Build the provider-agnostic generate function
+    generate_fn, model_label = build_generate_fn(
+        provider, api_key, model, project_id, location
+    )
+
+    # 2. Instantiate the EngineerAgent
+    agent = EngineerAgent(generate_fn=generate_fn, model_label=model_label)
+    click.secho(
+        f"[IMPACT ARBITER SUPERVISOR]  EngineerAgent instantiated "
+        f"(model={model_label}, max_retries={max_retries}).",
+        fg="magenta"
+    )
+
+    # 3. Run the AgentSupervisor loop
+    supervisor = AgentSupervisor(agent=agent, max_retries=max_retries)
+    passed = supervisor.run()
+
+    sys.exit(0 if passed else 1)
+
+
+if __name__ == "__main__":
+    cli()
