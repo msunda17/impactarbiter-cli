@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "impactarbiter-cli"
-version = "0.1.0"
-description = "ImpactArbiter MVP: Deterministic ML Infra Fuzzer for PagedAttention kernel validation."
+version = "0.2.0"
+description = "Open-source semantic testing harness that catches memory-routing bugs in agent-generated PagedAttention kernels."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -31,7 +31,10 @@ dependencies = [
     "sympy>=1.12",
     "litellm>=1.40.0",
     "python-dotenv>=1.0.0",
-    "numpy"
+    "numpy",
+    "rich>=13.7.0",
+    "pypdf>=4.0.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -67,9 +70,8 @@ dev = [
 ]
 
 [project.scripts]
-# Entry point: src/cli.py → cli() function
-# Uses hatchling src-layout so the package root is impact_arbiter inside src/
-impactarbiter = "src.cli:cli"
+# Entry point: src/cli/auto_heal.py → cli (click group)
+impactarbiter = "src.cli.auto_heal:cli"
 
 [project.urls]
 Homepage = "https://github.com/impactarbiter/impactarbiter-cli"

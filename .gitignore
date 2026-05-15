@@ -51,5 +51,11 @@ Thumbs.db
 # Traces
 traces/
 
+# Distill pipeline artifacts (auto-generated per run)
+distill_runs/
+
+# Validation suite artifacts (auto-generated per run)
+validation_traces/
+
 # Internal documentation
 INTERNAL_FEATURES.md
