@@ -202,9 +202,10 @@ def _first_divergent(per_token: List[dict]) -> Optional[dict]:
 # Per-oracle pipelines
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_paged_pipeline(
-    *, generate: Callable[[List[dict]], str], max_retries: int
+    *, generate: Callable[[List[dict]], str], max_retries: int, model: str
 ) -> int:
     console.print(Rule("[bold cyan]IMPACT ARBITER — AUTO-HEAL"))
+    console.print(f"[bold]Model:[/bold] {model}")
     db.init_db()
 
     # Stage 1: Download paper
@@ -359,9 +360,10 @@ def _run_paged_pipeline(
 
 
 def _run_radix_pipeline(
-    *, generate: Callable[[List[dict]], str], max_retries: int
+    *, generate: Callable[[List[dict]], str], max_retries: int, model: str
 ) -> int:
     console.print(Rule("[bold cyan]IMPACT ARBITER — AUTO-HEAL"))
+    console.print(f"[bold]Model:[/bold] {model}")
     db.init_db()
 
     # Stage 1: Download paper
@@ -575,11 +577,13 @@ def auto_heal_cmd(
             rc = _run_paged_pipeline(
                 generate=generate,
                 max_retries=max_retries,
+                model=model,
             )
         else:
             rc = _run_radix_pipeline(
                 generate=generate,
                 max_retries=max_retries,
+                model=model,
             )
     except RuntimeError as e:
         click.secho(f"❌ {e}", fg="red", bold=True)
