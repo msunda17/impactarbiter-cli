@@ -5,6 +5,51 @@
 
 LLM-generated unit tests for KV-cache routing kernels suffer from a silent failure mode: the LLM hallucinates the same bug in both the implementation and the test, causing the test to pass while the kernel remains incorrect. This happens because LLMs reason from the same flawed mental model when writing both code and tests. ImpactArbiter addresses this by using a two-stage RAG pipeline: first, a Distill Agent extracts and summarizes the routing logic from the actual research paper; second, a Coding Agent writes the implementation and test based on that summary. The generated code is then run through a PyTorch autograd trap that compares gradient signatures against SymPy oracles. The trap catches bugs that unit tests miss, even when the LLM's own test_route() assertions pass.
 
+## Setup
+
+### 1. Create Virtual Environment
+
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+### 2. Install in Development Mode
+
+```bash
+pip install -e .
+```
+
+### 3. Configure API Keys (Choose Your Provider)
+
+**OpenAI:**
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+# On Windows (PowerShell): $env:OPENAI_API_KEY="your-openai-api-key"
+```
+
+**Claude (Anthropic):**
+```bash
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
+# On Windows (PowerShell): $env:ANTHROPIC_API_KEY="your-anthropic-api-key"
+```
+
+**Gemini / Vertex AI:**
+```bash
+# Ensure gcloud is authenticated and project is set
+gcloud auth login
+gcloud config set project impactagent
+export GOOGLE_CLOUD_PROJECT="impactagent"
+# On Windows (PowerShell): $env:GOOGLE_CLOUD_PROJECT="impactagent"
+```
+
+**For persistent configuration, add these to your `.env` file:**
+```
+OPENAI_API_KEY=your-openai-api-key
+ANTHROPIC_API_KEY=your-anthropic-api-key
+GOOGLE_CLOUD_PROJECT=impactagent
+```
+
 ## Install
 
 ```bash
