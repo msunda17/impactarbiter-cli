@@ -1,4 +1,5 @@
 # ImpactArbiter
+> 📖 Read the full launch post and watch the 2D tensor collision demo here: https://maniksundar.substack.com/p/the-physics-illusion-why-llms-still
 
 ## Problem Statement
 
