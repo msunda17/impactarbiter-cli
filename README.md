@@ -98,7 +98,13 @@ divergence=0.00e+00 (after 1 heal attempts)
 
 ## Field results
 
-We ran 12 serving implementations. 7 failed gradient checks that unit tests passed.
+Summary statistics from `results.csv` (most recent evaluation run):
+
+| Oracle | Total Runs | Trap Fired | Healed Successfully |
+|--------|-----------|------------|---------------------|
+| radix-2d | 32 | 21 | 21 |
+| radix | 15 | 9 | 9 |
+| vllm | 15 | 0 | 0 |
 
 ## Repository layout
 
