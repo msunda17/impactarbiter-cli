@@ -7,8 +7,10 @@ Each oracle module exposes:
 
 from .paged_attention import paged_oracle
 from .radix_attention import radix_oracle
+from .radix_2d import radix_2d_oracle
 
 __all__ = [
     "paged_oracle",
     "radix_oracle",
+    "radix_2d_oracle",
 ]

@@ -15,6 +15,7 @@ Schema (table ``validation_traces``):
     divergence_map    TEXT
     healed_code       TEXT
     heal_success      INTEGER (0/1)
+    heal_attempts     INTEGER (number of heal attempts: 0, 1, 2, or 3)
 """
 
 from __future__ import annotations
@@ -42,19 +43,29 @@ CREATE TABLE IF NOT EXISTS validation_traces (
     agent_offset      INTEGER,
     divergence_map    TEXT,
     healed_code       TEXT,
-    heal_success      INTEGER DEFAULT 0
+    heal_success      INTEGER DEFAULT 0,
+    heal_attempts     INTEGER DEFAULT 0
 );
 """
 
 
 @contextmanager
 def _connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
+    """Create or open the SQLite database."""
     conn = sqlite3.connect(db_path)
+    # Add heal_attempts column if it doesn't exist (migration)
     try:
-        conn.execute(_SCHEMA)
-        yield conn
+        cursor = conn.cursor()
+        cursor.execute("SELECT heal_attempts FROM validation_traces LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        conn.execute("ALTER TABLE validation_traces ADD COLUMN heal_attempts INTEGER DEFAULT 0")
         conn.commit()
+    conn.execute(_SCHEMA)
+    try:
+        yield conn
     finally:
+        conn.commit()
         conn.close()
 
 
@@ -78,6 +89,7 @@ def insert_trace(
     divergence_map: str,
     healed_code: Optional[str] = None,
     heal_success: bool = False,
+    heal_attempts: int = 0,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
     """Insert a validation trace; returns the new row id."""
@@ -89,15 +101,15 @@ def insert_trace(
                 timestamp, oracle_type, prompt, generated_code, token_idx,
                 divergence_value, expected_block, expected_offset,
                 agent_block, agent_offset, divergence_map,
-                healed_code, heal_success
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                healed_code, heal_success, heal_attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ts, oracle_type, prompt, generated_code, token_idx,
                 float(divergence_value),
                 expected_block, expected_offset,
                 agent_block, agent_offset, divergence_map,
-                healed_code, 1 if heal_success else 0,
+                healed_code, 1 if heal_success else 0, heal_attempts,
             ),
         )
         return int(cur.lastrowid)
@@ -108,12 +120,13 @@ def update_heal(
     *,
     healed_code: str,
     heal_success: bool,
+    heal_attempts: int = 1,
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     with _connect(db_path) as conn:
         conn.execute(
-            "UPDATE validation_traces SET healed_code = ?, heal_success = ? WHERE id = ?",
-            (healed_code, 1 if heal_success else 0, trace_id),
+            "UPDATE validation_traces SET healed_code = ?, heal_success = ?, heal_attempts = ? WHERE id = ?",
+            (healed_code, 1 if heal_success else 0, heal_attempts, trace_id),
         )
 
 

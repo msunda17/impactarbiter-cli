@@ -156,10 +156,144 @@ def fuzz_radix(
     return results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2D Asymmetric Radix fixtures with per-head ring buffers
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Radix2DCase:
+    """One 2D Asymmetric Radix boundary fixture."""
+    b_local_idx: int
+    head_idx: int
+    prefix_length_h: int
+    total_blocks_h: int
+    expected_head: int
+    expected_block: int
+    expected_offset: int
+    note: str = ""
+
+
+# RADIX_2D test matrix (block_size = 16).
+# Mix of: asymmetric ragged boundaries (different prefix_length_h per head),
+# clean wraps, and ring-buffer modulo wrapping cases.
+RADIX_2D_TEST_MATRIX: List[Radix2DCase] = [
+    # ── Asymmetric ragged boundaries ────────────────────────────────────────
+    Radix2DCase(b_local_idx=0, head_idx=0, prefix_length_h=47, total_blocks_h=8,
+                expected_head=0, expected_block=2, expected_offset=15,
+                note="head=0 ragged straddle (prefix=47)"),
+    Radix2DCase(b_local_idx=0, head_idx=1, prefix_length_h=20, total_blocks_h=8,
+                expected_head=1, expected_block=1, expected_offset=4,
+                note="head=1 asymmetric prefix=20 (different from head=0)"),
+    Radix2DCase(b_local_idx=1, head_idx=0, prefix_length_h=47, total_blocks_h=8,
+                expected_head=0, expected_block=3, expected_offset=0,
+                note="head=0 wrap into next block"),
+    # ── Ring-buffer modulo wrap ─────────────────────────────────────────────
+    # total_blocks_h=4, block_size=16 → capacity = 64 tokens per head.
+    # prefix=60, b_local=5 → abs=65 → block = 65//16 = 4, wraps to 4 % 4 = 0.
+    Radix2DCase(b_local_idx=5, head_idx=0, prefix_length_h=60, total_blocks_h=4,
+                expected_head=0, expected_block=0, expected_offset=1,
+                note="ring-buffer wrap: abs=65, block 4 wraps to 0"),
+    # prefix=64, b_local=0 → abs=64 → block = 64//16 = 4, wraps to 0.
+    Radix2DCase(b_local_idx=0, head_idx=2, prefix_length_h=64, total_blocks_h=4,
+                expected_head=2, expected_block=0, expected_offset=0,
+                note="ring-buffer wrap at exact capacity"),
+    # Deep wrap: prefix=200, b_local=0, total=4 → abs=200, block=12, wraps to 0.
+    Radix2DCase(b_local_idx=0, head_idx=3, prefix_length_h=200, total_blocks_h=4,
+                expected_head=3, expected_block=0, expected_offset=8,
+                note="ring-buffer deep wrap (multiple revolutions)"),
+    # Per-head asymmetric ring sizes
+    Radix2DCase(b_local_idx=2, head_idx=1, prefix_length_h=30, total_blocks_h=2,
+                expected_head=1, expected_block=0, expected_offset=0,
+                note="small ring (N_h=2) wrap on head=1"),
+]
+
+
+def fuzz_radix_2d(
+    target_fn: Callable[..., Tuple[int, int, int]],
+    oracle_fn: Callable[..., Tuple[int, int, int]],
+    *,
+    block_size: int = 16,
+) -> List[dict]:
+    """Fuzz 2D Asymmetric Radix with explicit asymmetric + ring-buffer fixtures."""
+    results: List[dict] = []
+    for case in RADIX_2D_TEST_MATRIX:
+        base_row = {
+            "b_local_idx": case.b_local_idx,
+            "head_idx": case.head_idx,
+            "prefix_length_h": case.prefix_length_h,
+            "total_blocks_h": case.total_blocks_h,
+            "oracle_head": case.expected_head,
+            "oracle_block": case.expected_block,
+            "oracle_offset": case.expected_offset,
+            "note": case.note,
+        }
+        try:
+            raw = target_fn(
+                int(case.b_local_idx),
+                int(case.head_idx),
+                int(case.prefix_length_h),
+                int(case.total_blocks_h),
+                int(block_size),
+            )
+        except Exception as e:  # noqa: BLE001
+            results.append({
+                **base_row,
+                "agent_head": None, "agent_block": None, "agent_offset": None,
+                "diverged": True,
+                "error": f"agent crashed: {type(e).__name__}: {e}",
+            })
+            continue
+
+        # Reject None / wrong-shape returns explicitly so a silently broken
+        # signature adapter cannot masquerade as a passing case.
+        if raw is None or not hasattr(raw, "__iter__"):
+            results.append({
+                **base_row,
+                "agent_head": None, "agent_block": None, "agent_offset": None,
+                "diverged": True,
+                "error": f"agent returned non-tuple: {raw!r}",
+            })
+            continue
+        raw_list = list(raw)
+        if len(raw_list) != 3 or any(v is None for v in raw_list):
+            results.append({
+                **base_row,
+                "agent_head": raw_list[0] if len(raw_list) > 0 else None,
+                "agent_block": raw_list[1] if len(raw_list) > 1 else None,
+                "agent_offset": raw_list[2] if len(raw_list) > 2 else None,
+                "diverged": True,
+                "error": f"agent returned malformed tuple {raw_list!r} "
+                         f"(expected (head, block, offset))",
+            })
+            continue
+        agent_head, agent_block, agent_offset = raw_list
+        results.append({
+            "b_local_idx": case.b_local_idx,
+            "head_idx": case.head_idx,
+            "prefix_length_h": case.prefix_length_h,
+            "total_blocks_h": case.total_blocks_h,
+            "agent_head": int(agent_head),
+            "agent_block": int(agent_block),
+            "agent_offset": int(agent_offset),
+            "oracle_head": case.expected_head,
+            "oracle_block": case.expected_block,
+            "oracle_offset": case.expected_offset,
+            "diverged": (
+                (int(agent_head), int(agent_block), int(agent_offset))
+                != (case.expected_head, case.expected_block, case.expected_offset)
+            ),
+            "error": None,
+            "note": case.note,
+        })
+    return results
+
+
 __all__ = [
     "PAGED_ADVERSARIAL_TOKENS",
     "RADIX_TEST_MATRIX",
+    "RADIX_2D_TEST_MATRIX",
     "RadixCase",
+    "Radix2DCase",
     "fuzz_paged",
     "fuzz_radix",
+    "fuzz_radix_2d",
 ]

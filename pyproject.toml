@@ -32,6 +32,7 @@ dependencies = [
     "litellm>=1.40.0",
     "python-dotenv>=1.0.0",
     "numpy",
+    "pathlib",
     "rich>=13.7.0",
     "pypdf>=4.0.0",
     "requests>=2.31.0",

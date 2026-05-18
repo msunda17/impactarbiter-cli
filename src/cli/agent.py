@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import re
 import sys
 import tempfile
+import warnings
 from typing import Callable, List, Optional
+
+# Suppress Pydantic serialization warnings from litellm
+warnings.filterwarnings("ignore", message="PydanticSerialization")
+# Also suppress all UserWarnings from pydantic
+logging.getLogger("pydantic").setLevel(logging.ERROR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -15,8 +22,8 @@ from typing import Callable, List, Optional
 # ─────────────────────────────────────────────────────────────────────────────
 _MODEL_ALIASES = {
     "gemini": os.environ.get("IMPACTARBITER_GEMINI_MODEL", "vertex_ai/gemini-2.5-pro"),
-    "claude": os.environ.get("IMPACTARBITER_CLAUDE_MODEL", "anthropic/claude-3-5-sonnet-20241022"),
-    "openai": os.environ.get("IMPACTARBITER_OPENAI_MODEL", "gpt-4o"),
+    "claude": os.environ.get("IMPACTARBITER_CLAUDE_MODEL", "anthropic/claude-sonnet-4.6"),
+    "openai": os.environ.get("IMPACTARBITER_OPENAI_MODEL", "gpt-5.5"),
 }
 
 
@@ -61,17 +68,27 @@ def build_llm_client(model_alias: str) -> Callable[[List[dict]], str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Code extraction & dynamic loading
 # ─────────────────────────────────────────────────────────────────────────────
-_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+def extract_python_code(text: str) -> str:
+    """Extract Python code from markdown code blocks."""
+    # First, remove thinking tags to avoid interference
+    text_without_thinking = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+    
+    match = re.search(r"```python\s*([\s\S]*?)\s*```", text_without_thinking)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"```\s*([\s\S]*?)\s*```", text_without_thinking)
+    if match:
+        return match.group(1).strip()
+    return text_without_thinking.strip()
 
 
-def extract_python_code(raw: str) -> str:
-    """Pull a Python function body out of an LLM response (handles ``` fences)."""
-    if not raw:
-        return ""
-    m = _FENCE_RE.search(raw)
-    if m:
-        return m.group(1).strip()
-    return raw.strip()
+def extract_thinking(text: str) -> Optional[str]:
+    """Extract text between <thinking> and </thinking> tags."""
+    match = re.search(r"<thinking>\s*([\s\S]*?)\s*</thinking>", text)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def load_function_from_code(code: str, fn_name: str) -> Callable:
@@ -106,8 +123,10 @@ DISTILL_SYSTEM_PROMPT = (
 )
 
 CODING_SYSTEM_PROMPT = (
-    "You are an ML Infra Engineer. Output ONLY raw Python code containing "
-    "the requested functions — no markdown fences, no commentary."
+    "You are an ML Infra Engineer. You MUST output your internal reasoning and chain-of-thought "
+    "step-by-step inside <thinking> and </thinking> tags before you output your final Python code. "
+    "This is REQUIRED - do not skip the thinking tags. After the thinking tags, output ONLY raw Python code "
+    "containing the requested functions — no markdown fences, no commentary outside the thinking tags."
 )
 
 def build_distill_prompt(paper_excerpt: str) -> str:
@@ -116,26 +135,45 @@ def build_distill_prompt(paper_excerpt: str) -> str:
         f"--- PAPER EXCERPT ---\n{paper_excerpt}\n--- END EXCERPT ---\n\n"
         "You are an ML researcher. Extract ONLY the KV cache routing logic "
         "for Planner-to-Executor handoff in multi-agent serving. "
-        "Produce a concise, precise system specification that includes:\n"
-        "1. How the Executor inherits the Planner's prefix.\n"
-        "2. How the mapping handles ragged boundaries and partial blocks when the prefix ends mid-block.\n"
-        "3. Any mention of per-head asymmetry or dynamic multi-turn handoffs under ragged batches.\n"
+        "Produce a concise, precise system specification of the mathematical routing. "
         "Output ONLY the clean specification. No extra commentary."
     )
 
 
+def _is_2d_signature(fn_signature: str) -> bool:
+    """Detect the 2D Asymmetric Radix signature from the user-supplied prototype."""
+    return "head_idx" in fn_signature and "total_blocks_h" in fn_signature
+
+
 def build_pure_math_prompt(distill_summary: str, fn_signature: str) -> str:
-    """Step 2: Pure implementation from distilled math — intentionally hard for PagedAttention."""
+    if _is_2d_signature(fn_signature):
+        return (
+            f"--- DISTILLED SYSTEM SPECIFICATION ---\n{distill_summary}\n--- END SPECIFICATION ---\n\n"
+            f"Implement the 2D Asymmetric Radix routing function exactly as described:\n"
+            f"{fn_signature}\n"
+            "Return a plain tuple (head_idx, logical_block, offset).\n\n"
+            "MEMORY MODEL:\n"
+            "• The KV cache is a per-head ring buffer. Each head has its own circular "
+            "buffer of `total_blocks_h` physical blocks.\n"
+            "• Each head has its own prefix length `prefix_length_h`.\n"
+            "• The `head_idx` dimension must be preserved unchanged.\n\n"
+            "STRICT SIGNATURE CONSTRAINT — DO NOT VIOLATE:\n"
+            "• Use the EXACT function name and parameter names from the signature above. "
+            "Do NOT rename, reorder, drop, or merge parameters.\n"
+            "• Do NOT wrap the function in a class or introduce a NamedTuple.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "• Reason strictly from the spec above. Do not use memorized vLLM/SGLang code.\n"
+            "• Return ONLY the complete, minimal, executable Python function. "
+            "No docstrings, no comments, no explanations, no test functions.\n"
+            "Output ONLY the raw Python code."
+        )
+
+    # Legacy 1D path
     return (
         f"--- DISTILLED SYSTEM SPECIFICATION ---\n{distill_summary}\n--- END SPECIFICATION ---\n\n"
         f"Implement the following function exactly as described in the specification above:\n"
         f"{fn_signature}\n"
         "Return a tuple (logical_block, offset).\n\n"
-        "This is a real production Planner-to-Executor handoff in agentic serving:\n"
-        "• The Planner's prefix may end mid-block on some heads.\n"
-        "• Different heads may have different prefix lengths (asymmetric).\n"
-        "• The Executor must correctly continue writing into the shared partial block under ragged, multi-turn conditions.\n"
-        "• The sequence is dynamic, ragged, and multi-turn under live agentic load with multiple agents and batches.\n"
         "CRITICAL INSTRUCTIONS:\n"
         "• Reason strictly from the paper's math. Do not use memorized vLLM, SGLang, or standard PagedAttention code.\n"
         "• Return ONLY the complete, minimal, executable Python function. No docstrings, no comments, no explanations, no test functions.\n"
@@ -144,18 +182,36 @@ def build_pure_math_prompt(distill_summary: str, fn_signature: str) -> str:
 
 
 def build_refactor_prompt(pure_code: str) -> str:
-    """Step 3: Refactor into production-style code — keeps it hard."""
+    is_2d = "head_idx" in pure_code and "total_blocks_h" in pure_code
+    if is_2d:
+        return (
+            f"--- PURE MATH IMPLEMENTATION ---\n{pure_code}\n--- END IMPLEMENTATION ---\n\n"
+            "Refactor this into clean, production-ready Python code for a real "
+            "multi-head serving engine. Preserve the 2D Asymmetric Radix contract.\n\n"
+            "STRICT SIGNATURE CONSTRAINT — DO NOT VIOLATE:\n"
+            "• The refactored function MUST be named exactly `route_radix_2d`.\n"
+            "• It MUST accept five positional parameters in this exact order and with "
+            "these exact names:\n"
+            "    (b_local_idx, head_idx, prefix_length_h, total_blocks_h, block_size)\n"
+            "• Do NOT rename parameters, drop parameters, reorder them, or wrap the "
+            "function in a class. Do NOT introduce a NamedTuple return type — return "
+            "a plain tuple `(head_idx, logical_block, offset)`.\n\n"
+            "Additionally, include a `test_route()` function (no arguments) that uses "
+            "`assert` statements to validate `route_radix_2d` across at least one "
+            "ring-buffer wrap case and one asymmetric per-head case. Calling test_route() "
+            "must not raise.\n"
+            "Return ONLY `route_radix_2d` and `test_route()`. "
+            "No docstrings, no comments, no extra text."
+        )
+        
     return (
         f"--- PURE MATH IMPLEMENTATION ---\n{pure_code}\n--- END IMPLEMENTATION ---\n\n"
-        "Now refactor this pure math implementation into clean, production-ready Python code "
-        "for a real serving engine (vLLM/SGLang style). "
-        "Keep the exact same logic, but make it modular and ready for integration into a larger kernel "
-        "that handles multi-agent handoffs under ragged batches and dynamic multi-turn conditions.\n"
+        "Refactor this into clean, production-ready Python code for a real serving engine. "
+        "Make it modular and ready for integration into a larger kernel.\n"
         "Additionally, include a `test_route()` function (no arguments) that uses `assert` "
-        "statements to validate the routing function on block-aligned positions only "
-        "(e.g., prefix_length and token offsets that are exact multiples of block_size). "
-        "Do NOT assert on intra-block or ragged positions. Calling test_route() must not raise.\n"
-        "Return ONLY the routing function and `test_route()`. No docstrings, no comments, no extra text."
+        "statements to validate the routing function. Calling test_route() must not raise.\n"
+        "Return ONLY the routing function and `test_route()`. "
+        "No docstrings, no comments, no extra text."
     )
 
 
@@ -166,25 +222,33 @@ def build_heal_payload(
     agent_offset: int,
     token_label: str,
     fn_name: str,
+    *,
+    require_thinking_tags: bool = False,
 ) -> str:
     """Step 4: Clean gradient feedback — actionable for both oracles."""
+    thinking_instruction = (
+        f"IMPORTANT: You MUST output your reasoning inside <thinking> and </thinking> tags before the code. "
+        f"This is REQUIRED - do not skip the thinking tags. Then output the corrected `{fn_name}` function."
+        if require_thinking_tags
+        else f"Then output the corrected `{fn_name}` function."
+    )
     return (
         f"CRITICAL FAILURE at {token_label}:\n"
         f"Expected (logical_block={expected_block}, offset={expected_offset})\n"
         f"Got      (logical_block={agent_block}, offset={agent_offset})\n"
         f"The autograd trap detected a gradient divergence. "
         f"This indicates a memory routing error where the Executor wrote to the wrong physical slot "
-        f"in the shared KV cache (partial-block continuation failed under ragged boundary).\n"
-        f"Refactor the `{fn_name}` function to correctly handle the case where the Planner's prefix "
-        f"ends mid-block on some heads while maintaining correct handoff for all heads under dynamic multi-turn conditions.\n"
+        f"in the shared KV cache.\n"
+        f"Refactor the `{fn_name}` function to correctly handle the continuous physical constraints.\n"
         f"Use only the mathematical specification from the paper.\n"
-        f"Output ONLY the corrected `{fn_name}` function. No extra text."
+        f"{thinking_instruction}"
     )
 
 __all__ = [
     "resolve_model",
     "build_llm_client",
     "extract_python_code",
+    "extract_thinking",
     "load_function_from_code",
     "DISTILL_SYSTEM_PROMPT",
     "CODING_SYSTEM_PROMPT",
