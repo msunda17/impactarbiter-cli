@@ -123,6 +123,36 @@ pytest tests/ -v
 
 The four load-bearing claims in `tests/test_trap.py` must all pass.
 
+## Contributing
+
+ImpactArbiter is an open project — contributions of new oracles, fuzz cases, and bug reports are welcome.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full contributor guide. A short summary:
+
+- **Reporting issues**: open a GitHub issue using the relevant template under `.github/ISSUE_TEMPLATE/`. Bug reports must include the exact CLI command, the model used, the divergence map (or stack trace), and the contents of `nextpaper.db` row(s) when relevant.
+- **Contributing a new oracle**: every oracle must ship as a triple — (1) a SymPy AST plus a `lambdified` callable in `src/oracles/`, (2) a deterministic autograd trap in `src/trap/`, and (3) explicit boundary fixtures in `src/fuzzer/`. PRs without all three will be sent back.
+- **Discussing methodology**: open a `methodology` issue — these are reviewed weekly and used to calibrate the mock hallucination rates and per-oracle session windows.
+
+### Issue types
+
+| Template | When to use |
+|----------|-------------|
+| `bug_report.md` | The trap, auto-heal, evaluator, or CSV export produces incorrect or crashing behavior. |
+| `oracle_contribution.md` | You want to propose a new attention/routing oracle (e.g. FlashInfer, MLA, sliding-window). |
+| `methodology.md` | You disagree with a hallucination-rate calibration, session-window definition, or trap tolerance. |
+
+### Reporting a bug — minimum reproducible report
+
+A bug is only actionable when we can replay the failure deterministically. Please include:
+
+1. **Command line** — the exact `impactarbiter ...` invocation, including all flags.
+2. **Environment** — Python version, OS, and whether `--live` or `--mock` was used.
+3. **Model identity** (if `--live`) — e.g. `vertex_ai/gemini-2.5-pro`. Do not paste API keys.
+4. **Failure surface** — paste either the gradient divergence map, the auto-heal stack trace, or the `results.csv` summary block.
+5. **Expected vs actual** — what the oracle predicts vs what the agent / trap returned.
+
+If the bug is in the trap itself (false PASS or false FAIL), attach the offending agent function and the corresponding boundary case from `src/fuzzer/`. Trap correctness bugs are treated as P0.
+
 ## License
 
 MIT.

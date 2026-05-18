@@ -2,6 +2,39 @@
 
 Thanks for considering a contribution. ImpactArbiter is a verification tool — every new oracle, trap, or boundary condition you add directly hardens the project's ability to catch silent KV-cache routing bugs.
 
+## Reporting Issues
+
+All issues are filed through GitHub Issues. Blank issues are disabled; please pick the right template:
+
+- **`bug_report`** — `.github/ISSUE_TEMPLATE/bug_report.md`. Use when the trap, auto-heal pipeline, evaluator, or CSV export produces incorrect or crashing behavior.
+- **`oracle_contribution`** — `.github/ISSUE_TEMPLATE/oracle_contribution.md`. Use *before* opening a PR for a new attention / routing oracle so the design can be calibrated.
+- **`methodology`** — `.github/ISSUE_TEMPLATE/methodology.md`. Use when you disagree with a hallucination-rate calibration, session-window definition, or trap tolerance. Methodology issues require empirical evidence (≥ 20 live runs).
+
+### What every bug report must include
+
+A bug is only actionable if we can replay it deterministically. Provide:
+
+1. The exact `impactarbiter ...` command, including all flags.
+2. OS, Python version, and `--live` vs `--mock`.
+3. Model identity if `--live` (e.g. `vertex_ai/gemini-2.5-pro`). **Never paste API keys.**
+4. The failure surface — pick one:
+   - the gradient divergence map,
+   - the full Python stack trace, or
+   - the offending `results.csv` rows + summary block.
+5. Expected vs actual: oracle prediction vs agent / trap output.
+
+### Trap correctness bugs are P0
+
+If you suspect the autograd trap itself is wrong (false PASS or false FAIL), include the offending agent function and the boundary case from `src/fuzzer/` that should have caught it. These take priority over feature work.
+
+### Triage labels
+
+- `bug` — incorrect behavior with a reproducer
+- `oracle` — new attention / routing mechanism
+- `methodology` — calibration / window / tolerance debate
+- `enhancement` — additive change, no behavior break
+- `P0` — trap correctness or data-integrity bug
+
 ## How to Propose a New Oracle
 
 ImpactArbiter's oracles are SymPy-based ground-truth specifications for KV-cache routing mechanisms. To add a new oracle:
