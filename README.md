@@ -50,12 +50,6 @@ ANTHROPIC_API_KEY=your-anthropic-api-key
 GOOGLE_CLOUD_PROJECT=impactagent
 ```
 
-## Install
-
-```bash
-pip install impactarbiter
-```
-
 ## Demo Command
 
 ```bash
